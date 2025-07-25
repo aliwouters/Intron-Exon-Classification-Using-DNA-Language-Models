@@ -1,0 +1,181 @@
+# Project 2
+## Dependencies and Imports
+!pip install transformers biopython scikit-learn tqdm --quiet
+import os
+import torch
+import pickle
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from Bio import SeqIO
+from scipy.stats import mode
+from transformers import AutoTokenizer, AutoModel
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report
+from google.colab import files
+
+## Connecting to Google Drive and Accessing Files
+# Connect notebook to Google Drive
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+# Navigate to the shared drive folder
+%cd /content/drive/'My Drive'/'CS 121'/'Project 2'
+!pwd
+!ls
+
+## Load HyenaDNA model
+model_id = "LongSafari/hyenadna-tiny-1k-seqlen-hf"
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModel.from_pretrained(model_id, trust_remote_code=True).eval()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+## Embedding Function with Truncation
+def embed_dna_window(seq):
+    """Embed a short DNA chunk (max 1024 bases) using HyenaDNA."""
+    seq = seq[:1024]  # force truncate just in case
+    inputs = tokenizer(seq, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state[0][1:].cpu().numpy()  # drop CLS token
+
+def embed_full_sequence(sequence, window_size=1024, stride=512):
+    """Embed a long DNA sequence in overlapping windows and stitch them together."""
+    all_embeddings = []
+    for start in range(0, len(sequence), stride):
+        end = min(start + window_size, len(sequence))
+        window_seq = sequence[start:end]
+        if len(window_seq) < 10:
+            continue
+        emb = embed_dna_window(window_seq)[:end - start]
+        all_embeddings.append((start, emb))
+
+    full = np.zeros((len(sequence), emb.shape[1]), dtype=np.float32)
+    counts = np.zeros(len(sequence), dtype=np.int32)
+
+    for start, emb in all_embeddings:
+        end = start + len(emb)
+        full[start:end] += emb
+        counts[start:end] += 1
+
+    full = full / np.maximum(counts[:, None], 1)
+    return full
+
+## Handling overlap + voting
+def safe_mode(votes):
+    """Return the most frequent value in votes (robust to scipy version)."""
+    m = mode(votes, keepdims=True)
+    if hasattr(m, "mode"):
+        return m.mode[0]
+    return m[0]
+
+def predict_full_sequence(seq, window_size=1024, stride=512):
+    """Embed a long DNA sequence in overlapping windows and merge predictions."""
+    seq_len = len(seq)
+    all_preds = np.zeros((seq_len, 0), dtype=np.uint8)  # collect predictions per base
+
+    for start in range(0, seq_len, stride):
+        end = min(start + window_size, seq_len)
+        window_seq = seq[start:end]
+
+        if len(window_seq) < 10:  # skip tiny edge windows
+            continue
+
+        # Embed & predict
+        emb = embed_dna_window(window_seq)
+        pred = clf.predict(emb[:end - start])
+
+        # Add predictions to master array
+        padded_preds = np.full((seq_len,), -1, dtype=np.int8)
+        padded_preds[start:end] = pred
+        all_preds = np.column_stack((all_preds, padded_preds))
+
+    # Majority vote across overlapping predictions
+    valid_mask = all_preds != -1
+    majority_preds = []
+    for i in range(seq_len):
+      votes = all_preds[i][valid_mask[i]]
+      if len(votes) > 0:
+        majority = safe_mode(votes)
+      else:
+        majority = 0
+      majority_preds.append(majority)
+
+
+
+    return np.array(majority_preds)
+
+## Load Data and Sequences
+train_df = pd.read_csv("train.tsv", sep="\t")
+test_df = pd.read_csv("test.tsv", sep="\t")
+
+seq_dict = {}
+for record in SeqIO.parse("sequences.fasta", "fasta"):
+    seq_dict[record.id.strip()] = str(record.seq)
+
+## Memory-Efficient Training: Process in chunks
+from sklearn.linear_model import SGDClassifier
+
+clf = SGDClassifier(loss='log_loss', max_iter=1, learning_rate='optimal', warm_start=True)
+label_encoder = LabelEncoder()
+
+X_val, y_val = [], []
+classes_known = False
+batch_size = 1000  # How many nucleotides to embed before training a partial fit
+
+X_batch, y_batch = [], []
+
+print("Training in mini-batches...")
+for idx, row in tqdm(train_df.iterrows(), total=len(train_df)):
+    seq_id = row["id"]
+    sequence = seq_dict[seq_id]
+    label_str = row["label"].strip()
+
+    embedding = embed_full_sequence(sequence)
+    labels = np.array([int(c) for c in label_str[:len(embedding)]])
+    embedding = embedding[:len(labels)]
+
+    X_batch.extend(embedding)
+    y_batch.extend(labels)
+
+    if len(X_batch) >= batch_size:
+        X_batch = np.array(X_batch)
+        y_batch = np.array(y_batch)
+
+        if not classes_known:
+            label_encoder.fit(y_batch)
+            classes_known = True
+
+        clf.partial_fit(X_batch, label_encoder.transform(y_batch), classes=label_encoder.classes_)
+        X_batch, y_batch = [], []
+
+# Train on remaining examples
+if X_batch:
+    X_batch = np.array(X_batch)
+    y_batch = np.array(y_batch)
+    clf.partial_fit(X_batch, label_encoder.transform(y_batch))
+
+print("Done training!")
+
+## Predict Test Set
+predictions = []
+
+for gene_id in tqdm(test_df["id"].values, desc="Predicting test set"):
+    sequence = seq_dict[gene_id]
+    pred = predict_full_sequence(sequence)
+    pred_str = ''.join(str(x) for x in pred)
+    predictions.append(pred_str)
+
+test_df["label"] = predictions
+test_df[["id", "label"]].to_csv("predictions.csv", index=False, header=False)
+
+## Save Predictions
+test_df["label"] = predictions
+test_df[["id", "label"]].to_csv("predictions.csv", sep="\t", index=False, header=False)
+
+!zip -q predictions.zip predictions.csv
+files.download("predictions.zip")
+print("predictions.zip is downloaded")
+
